@@ -1,0 +1,1106 @@
+{
+  "name": "Vigilancia Licitaciones Culturales — plantilla compartible",
+  "nodes": [
+    {
+      "parameters": {
+        "rule": {
+          "interval": [
+            {
+              "triggerAtHour": 7
+            }
+          ]
+        }
+      },
+      "id": "c13d481d-ea09-4e99-bcfb-31cfd5976ecd",
+      "name": "⏰ Cada día a las 7h",
+      "type": "n8n-nodes-base.scheduleTrigger",
+      "typeVersion": 1.1,
+      "position": [
+        240,
+        256
+      ]
+    },
+    {
+      "parameters": {
+        "jsCode": "// ============================================================\n// DESCARGA + PAGINACIÓN + PARSEO ATOM — v11 (filtro PUB + limpieza texto)\n// - next SOLO se busca en la cabecera del feed (antes de la\n//   primera <entry>), en cualquier orden de atributos.\n// - Tope duro de páginas para que NUNCA se cuelgue.\n// - Si no hay next, procesa la primera página y termina.\n// ============================================================\n\nconst urlBase = 'https://contrataciondelsectorpublico.gob.es/sindicacion/sindicacion_643/licitacionesPerfilesContratanteCompleto3.atom';\nconst desde = new Date(Date.now() - 3 * 24 * 60 * 60 * 1000).toISOString().split('T')[0];\nconst hasta = new Date().toISOString().split('T')[0];\nconst MAX_PAGINAS = 10;   // red de seguridad: nunca más de 10 páginas\n\n// Solo licitaciones con el plazo abierto. PUB = en plazo de presentación.\n// Añade 'PRE' si quieres ver también los anuncios previos.\nconst ESTADOS_VALIDOS = ['PUB'];\n\nfunction decode(s){\n  if (s == null) return '';\n  return String(s)\n    .replace(/<!\\[CDATA\\[([\\s\\S]*?)\\]\\]>/g, '$1')\n    .replace(/&lt;/g,'<').replace(/&gt;/g,'>')\n    .replace(/&quot;/g,'\"').replace(/&#39;/g,\"'\").replace(/&apos;/g,\"'\")\n    .replace(/&amp;/g,'&')\n    .trim();\n}\n\nfunction stripTags(s){ return String(s||'').replace(/<[^>]*>/g,'').trim(); }\n// Neutraliza comillas y saltos que rompen el JSON del body de Ollama\nfunction limpiarTexto(s){ return String(s||'').replace(/&#x?[0-9a-fA-F]+;/g,' ').replace(/[\\r\\n]+/g,' ').replace(/\"/g,\"'\").replace(/\\s+/g,' ').trim(); }\nfunction firstTag(xml, suffix){\n  const re = new RegExp('<([\\\\w-]+:)?' + suffix + '\\\\b[^>]*>([\\\\s\\\\S]*?)<\\\\/([\\\\w-]+:)?' + suffix + '>', 'i');\n  const m = xml.match(re);\n  return m ? decode(m[2]) : '';\n}\n\n// Busca rel=\"next\" en cualquier orden de atributos, SOLO en el texto dado\nfunction findNext(headerXml){\n  const links = headerXml.match(/<link\\b[^>]*>/gi) || [];\n  for (const tag of links){\n    if (/rel=[\"']next[\"']/i.test(tag)){\n      const h = tag.match(/href=[\"']([^\"']+)[\"']/i);\n      if (h) return decode(h[1]);\n    }\n  }\n  return '';\n}\n\nfunction splitEntries(xml){\n  const out = [];\n  const re = /<entry\\b[^>]*>([\\s\\S]*?)<\\/entry>/gi;\n  let m;\n  while ((m = re.exec(xml)) !== null){ out.push(m[1]); }\n  return out;\n}\n\nfunction parseEntry(entryXml){\n  const titulo = firstTag(entryXml, 'title') || 'Sin título';\n  const descripcion = firstTag(entryXml, 'summary') || '';\n  const fechaPublicacion = firstTag(entryXml, 'updated') || firstTag(entryXml, 'published') || '';\n  let link = '';\n  const linkTags = entryXml.match(/<link\\b[^>]*>/gi) || [];\n  const alt = linkTags.find(t => /rel=[\"']alternate[\"']/i.test(t)) || linkTags[0];\n  if (alt){ const h = alt.match(/href=[\"']([^\"']+)[\"']/i); if (h) link = decode(h[1]); }\n\n  const organismo  = stripTags(firstTag(entryXml, 'PartyName') || firstTag(entryXml, 'Name') || '');\n  const presupuesto = stripTags(firstTag(entryXml, 'TaxExclusiveAmount') || firstTag(entryXml, 'TotalAmount') || firstTag(entryXml, 'Amount') || 'No especificado');\n  const cpv = firstTag(entryXml, 'ItemClassificationCode') || firstTag(entryXml, 'ClassificationCode') || '';\n  const estado = firstTag(entryXml, 'ContractFolderStatusCode') || firstTag(entryXml, 'StatusCode') || '';\n  const fechaLimite = firstTag(entryXml, 'EndDate') || firstTag(entryXml, 'DeadlineDate') || 'Ver pliego';\n\n  // Extraer idEvl del link como identificador único de la licitación\n  let idEvl = '';\n  const mId = String(link).match(/idEvl=([^&]+)/i);\n  if (mId) idEvl = decodeURIComponent(mId[1]);\n  const tituloLimpio = limpiarTexto(titulo);\n  const descripcionLimpia = limpiarTexto(descripcion);\n  const textoCompleto = `${tituloLimpio} ${descripcionLimpia}`.toLowerCase();\n  return { idEvl, titulo: tituloLimpio, descripcion: descripcionLimpia, link, organismo: limpiarTexto(organismo), presupuesto, cpv, estado, fechaLimite, textoCompleto, fechaPublicacion };\n}\n\nconst salida = [];\nlet nextUrl = urlBase;\nlet pagina = 0;\n\nwhile (nextUrl && pagina < MAX_PAGINAS){\n  pagina++;\n\n  let xml;\n  try {\n    xml = await this.helpers.httpRequest({\n      method: 'GET',\n      url: nextUrl,\n      headers: { 'User-Agent': 'Mozilla/5.0 (compatible; n8n-licitaciones/1.0)' },\n      timeout: 120000,\n      json: false\n    });\n  } catch (e){ break; }\n  if (typeof xml !== 'string') xml = String(xml);\n\n  // separar cabecera (antes de la primera <entry>) del resto\n  const idx = xml.search(/<entry\\b/i);\n  const cabecera = idx > -1 ? xml.slice(0, idx) : xml;\n\n  const entries = splitEntries(xml);\n  let fechasPagina = [];\n  for (const eXml of entries){\n    const p = parseEntry(eXml);\n    const fechaPub = String(p.fechaPublicacion).slice(0,10);\n    if (fechaPub) fechasPagina.push(fechaPub);\n    if (fechaPub && fechaPub >= desde && fechaPub <= hasta && ESTADOS_VALIDOS.includes(p.estado)){\n      salida.push({ json: p });\n    }\n  }\n\n  const candidato = findNext(cabecera);\n  const minFecha = fechasPagina.length ? fechasPagina.sort()[0] : '';\n\n  if (!candidato || (minFecha && minFecha < desde)){\n    nextUrl = null;\n  } else {\n    nextUrl = candidato;\n  }\n}\n\nif (salida.length === 0){\n  return [{ json: { _vacio: true, mensaje: 'Sin licitaciones en la ventana', desde, hasta, paginasLeidas: pagina } }];\n}\nreturn salida;"
+      },
+      "id": "6d73a381-30d1-4f4e-9645-092c7cf7c65d",
+      "name": "🌀 Descargar+Paginar+Parsear",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        464,
+        256
+      ]
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "strict",
+            "version": 1
+          },
+          "conditions": [
+            {
+              "id": "c1",
+              "leftValue": "={{ $json.textoCompleto }}",
+              "rightValue": "museo",
+              "operator": {
+                "type": "string",
+                "operation": "contains"
+              }
+            },
+            {
+              "id": "c2",
+              "leftValue": "={{ $json.textoCompleto }}",
+              "rightValue": "digitaliz",
+              "operator": {
+                "type": "string",
+                "operation": "contains"
+              }
+            },
+            {
+              "id": "c3",
+              "leftValue": "={{ $json.textoCompleto }}",
+              "rightValue": "exposici",
+              "operator": {
+                "type": "string",
+                "operation": "contains"
+              }
+            },
+            {
+              "id": "c4",
+              "leftValue": "={{ $json.textoCompleto }}",
+              "rightValue": "patrimonio",
+              "operator": {
+                "type": "string",
+                "operation": "contains"
+              }
+            },
+            {
+              "id": "c5",
+              "leftValue": "={{ $json.textoCompleto }}",
+              "rightValue": "cultural",
+              "operator": {
+                "type": "string",
+                "operation": "contains"
+              }
+            },
+            {
+              "id": "c6",
+              "leftValue": "={{ $json.textoCompleto }}",
+              "rightValue": "contenidos digital",
+              "operator": {
+                "type": "string",
+                "operation": "contains"
+              }
+            },
+            {
+              "id": "c7",
+              "leftValue": "={{ $json.textoCompleto }}",
+              "rightValue": "realidad aumentada",
+              "operator": {
+                "type": "string",
+                "operation": "contains"
+              }
+            },
+            {
+              "id": "c8",
+              "leftValue": "={{ $json.textoCompleto }}",
+              "rightValue": "audiovisual",
+              "operator": {
+                "type": "string",
+                "operation": "contains"
+              }
+            },
+            {
+              "id": "c9",
+              "leftValue": "={{ $json.textoCompleto }}",
+              "rightValue": "fotografía",
+              "operator": {
+                "type": "string",
+                "operation": "contains"
+              }
+            },
+            {
+              "id": "c10",
+              "leftValue": "={{ $json.textoCompleto }}",
+              "rightValue": "turismo digital",
+              "operator": {
+                "type": "string",
+                "operation": "contains"
+              }
+            },
+            {
+              "id": "c11",
+              "leftValue": "={{ $json.textoCompleto }}",
+              "rightValue": "interactiv",
+              "operator": {
+                "type": "string",
+                "operation": "contains"
+              }
+            },
+            {
+              "id": "c12",
+              "leftValue": "={{ $json.textoCompleto }}",
+              "rightValue": "app móvil",
+              "operator": {
+                "type": "string",
+                "operation": "contains"
+              }
+            },
+            {
+              "id": "c13",
+              "leftValue": "={{ $json.textoCompleto }}",
+              "rightValue": "teatro",
+              "operator": {
+                "type": "string",
+                "operation": "contains"
+              }
+            },
+            {
+              "id": "c14",
+              "leftValue": "={{ $json.textoCompleto }}",
+              "rightValue": "ópera",
+              "operator": {
+                "type": "string",
+                "operation": "contains"
+              }
+            },
+            {
+              "id": "c15",
+              "leftValue": "={{ $json.textoCompleto }}",
+              "rightValue": "opera",
+              "operator": {
+                "type": "string",
+                "operation": "contains"
+              }
+            },
+            {
+              "id": "c16",
+              "leftValue": "={{ $json.textoCompleto }}",
+              "rightValue": "contenidos",
+              "operator": {
+                "type": "string",
+                "operation": "contains"
+              }
+            },
+            {
+              "id": "c17",
+              "leftValue": "={{ $json.textoCompleto }}",
+              "rightValue": "plataforma",
+              "operator": {
+                "type": "string",
+                "operation": "contains"
+              }
+            },
+            {
+              "id": "c18",
+              "leftValue": "={{ $json.textoCompleto }}",
+              "rightValue": "transcodif",
+              "operator": {
+                "type": "string",
+                "operation": "contains"
+              }
+            },
+            {
+              "id": "c19",
+              "leftValue": "={{ $json.textoCompleto }}",
+              "rightValue": "multimedia",
+              "operator": {
+                "type": "string",
+                "operation": "contains"
+              }
+            },
+            {
+              "id": "c20",
+              "leftValue": "={{ $json.textoCompleto }}",
+              "rightValue": "streaming",
+              "operator": {
+                "type": "string",
+                "operation": "contains"
+              }
+            },
+            {
+              "id": "c21",
+              "leftValue": "={{ $json.textoCompleto }}",
+              "rightValue": "archivo",
+              "operator": {
+                "type": "string",
+                "operation": "contains"
+              }
+            },
+            {
+              "id": "c22",
+              "leftValue": "={{ $json.textoCompleto }}",
+              "rightValue": "biblioteca",
+              "operator": {
+                "type": "string",
+                "operation": "contains"
+              }
+            },
+            {
+              "id": "c23",
+              "leftValue": "={{ $json.textoCompleto }}",
+              "rightValue": "turismo",
+              "operator": {
+                "type": "string",
+                "operation": "contains"
+              }
+            },
+            {
+              "id": "c24",
+              "leftValue": "={{ $json.textoCompleto }}",
+              "rightValue": "señalética",
+              "operator": {
+                "type": "string",
+                "operation": "contains"
+              }
+            },
+            {
+              "id": "c25",
+              "leftValue": "={{ $json.textoCompleto }}",
+              "rightValue": "sitio web",
+              "operator": {
+                "type": "string",
+                "operation": "contains"
+              }
+            },
+            {
+              "id": "c26",
+              "leftValue": "={{ $json.textoCompleto }}",
+              "rightValue": "página web",
+              "operator": {
+                "type": "string",
+                "operation": "contains"
+              }
+            },
+            {
+              "id": "c27",
+              "leftValue": "={{ $json.textoCompleto }}",
+              "rightValue": "portal web",
+              "operator": {
+                "type": "string",
+                "operation": "contains"
+              }
+            },
+            {
+              "id": "c28",
+              "leftValue": "={{ $json.textoCompleto }}",
+              "rightValue": "aplicación móvil",
+              "operator": {
+                "type": "string",
+                "operation": "contains"
+              }
+            },
+            {
+              "id": "c29",
+              "leftValue": "={{ $json.textoCompleto }}",
+              "rightValue": "app ",
+              "operator": {
+                "type": "string",
+                "operation": "contains"
+              }
+            },
+            {
+              "id": "c30",
+              "leftValue": "={{ $json.textoCompleto }}",
+              "rightValue": "vídeo",
+              "operator": {
+                "type": "string",
+                "operation": "contains"
+              }
+            },
+            {
+              "id": "c31",
+              "leftValue": "={{ $json.textoCompleto }}",
+              "rightValue": "video",
+              "operator": {
+                "type": "string",
+                "operation": "contains"
+              }
+            },
+            {
+              "id": "c32",
+              "leftValue": "={{ $json.textoCompleto }}",
+              "rightValue": "producción audiovisual",
+              "operator": {
+                "type": "string",
+                "operation": "contains"
+              }
+            },
+            {
+              "id": "c33",
+              "leftValue": "={{ $json.textoCompleto }}",
+              "rightValue": "catalogación",
+              "operator": {
+                "type": "string",
+                "operation": "contains"
+              }
+            },
+            {
+              "id": "c34",
+              "leftValue": "={{ $json.textoCompleto }}",
+              "rightValue": "colección",
+              "operator": {
+                "type": "string",
+                "operation": "contains"
+              }
+            },
+            {
+              "id": "c35",
+              "leftValue": "={{ $json.textoCompleto }}",
+              "rightValue": "arte",
+              "operator": {
+                "type": "string",
+                "operation": "contains"
+              }
+            },
+            {
+              "id": "c36",
+              "leftValue": "={{ $json.textoCompleto }}",
+              "rightValue": "artístic",
+              "operator": {
+                "type": "string",
+                "operation": "contains"
+              }
+            },
+            {
+              "id": "c37",
+              "leftValue": "={{ $json.textoCompleto }}",
+              "rightValue": "escénic",
+              "operator": {
+                "type": "string",
+                "operation": "contains"
+              }
+            },
+            {
+              "id": "c38",
+              "leftValue": "={{ $json.textoCompleto }}",
+              "rightValue": "festival",
+              "operator": {
+                "type": "string",
+                "operation": "contains"
+              }
+            },
+            {
+              "id": "c39",
+              "leftValue": "={{ $json.textoCompleto }}",
+              "rightValue": "auditorio",
+              "operator": {
+                "type": "string",
+                "operation": "contains"
+              }
+            },
+            {
+              "id": "c40",
+              "leftValue": "={{ $json.textoCompleto }}",
+              "rightValue": "filmac",
+              "operator": {
+                "type": "string",
+                "operation": "contains"
+              }
+            },
+            {
+              "id": "c41",
+              "leftValue": "={{ $json.textoCompleto }}",
+              "rightValue": "grabación",
+              "operator": {
+                "type": "string",
+                "operation": "contains"
+              }
+            },
+            {
+              "id": "c42",
+              "leftValue": "={{ $json.textoCompleto }}",
+              "rightValue": "realidad virtual",
+              "operator": {
+                "type": "string",
+                "operation": "contains"
+              }
+            },
+            {
+              "id": "c43",
+              "leftValue": "={{ $json.textoCompleto }}",
+              "rightValue": "metaverso",
+              "operator": {
+                "type": "string",
+                "operation": "contains"
+              }
+            },
+            {
+              "id": "c44",
+              "leftValue": "={{ $json.textoCompleto }}",
+              "rightValue": "gemelo digital",
+              "operator": {
+                "type": "string",
+                "operation": "contains"
+              }
+            },
+            {
+              "id": "c45",
+              "leftValue": "={{ $json.textoCompleto }}",
+              "rightValue": "visita virtual",
+              "operator": {
+                "type": "string",
+                "operation": "contains"
+              }
+            },
+            {
+              "id": "c46",
+              "leftValue": "={{ $json.textoCompleto }}",
+              "rightValue": "documental",
+              "operator": {
+                "type": "string",
+                "operation": "contains"
+              }
+            },
+            {
+              "id": "c47",
+              "leftValue": "={{ $json.textoCompleto }}",
+              "rightValue": "sonido",
+              "operator": {
+                "type": "string",
+                "operation": "contains"
+              }
+            },
+            {
+              "id": "c48",
+              "leftValue": "={{ $json.textoCompleto }}",
+              "rightValue": "iluminación espectác",
+              "operator": {
+                "type": "string",
+                "operation": "contains"
+              }
+            },
+            {
+              "id": "c49",
+              "leftValue": "={{ $json.textoCompleto }}",
+              "rightValue": "gestión de contenidos",
+              "operator": {
+                "type": "string",
+                "operation": "contains"
+              }
+            },
+            {
+              "id": "c50",
+              "leftValue": "={{ $json.textoCompleto }}",
+              "rightValue": "cms",
+              "operator": {
+                "type": "string",
+                "operation": "contains"
+              }
+            },
+            {
+              "id": "c51",
+              "leftValue": "={{ $json.textoCompleto }}",
+              "rightValue": "experiencia inmersiva",
+              "operator": {
+                "type": "string",
+                "operation": "contains"
+              }
+            },
+            {
+              "id": "c52",
+              "leftValue": "={{ $json.textoCompleto }}",
+              "rightValue": "inmersiv",
+              "operator": {
+                "type": "string",
+                "operation": "contains"
+              }
+            },
+            {
+              "id": "c53",
+              "leftValue": "={{ $json.textoCompleto }}",
+              "rightValue": "fotogrametría",
+              "operator": {
+                "type": "string",
+                "operation": "contains"
+              }
+            },
+            {
+              "id": "c54",
+              "leftValue": "={{ $json.textoCompleto }}",
+              "rightValue": "escaneado 3d",
+              "operator": {
+                "type": "string",
+                "operation": "contains"
+              }
+            },
+            {
+              "id": "c55",
+              "leftValue": "={{ $json.textoCompleto }}",
+              "rightValue": "modelado 3d",
+              "operator": {
+                "type": "string",
+                "operation": "contains"
+              }
+            },
+            {
+              "id": "c56",
+              "leftValue": "={{ $json.cpv }}",
+              "rightValue": "92521",
+              "operator": {
+                "type": "string",
+                "operation": "contains"
+              }
+            },
+            {
+              "id": "c57",
+              "leftValue": "={{ $json.cpv }}",
+              "rightValue": "92500",
+              "operator": {
+                "type": "string",
+                "operation": "contains"
+              }
+            },
+            {
+              "id": "c58",
+              "leftValue": "={{ $json.cpv }}",
+              "rightValue": "79952",
+              "operator": {
+                "type": "string",
+                "operation": "contains"
+              }
+            },
+            {
+              "id": "c59",
+              "leftValue": "={{ $json.cpv }}",
+              "rightValue": "48825",
+              "operator": {
+                "type": "string",
+                "operation": "contains"
+              }
+            },
+            {
+              "id": "c60",
+              "leftValue": "={{ $json.cpv }}",
+              "rightValue": "72413",
+              "operator": {
+                "type": "string",
+                "operation": "contains"
+              }
+            },
+            {
+              "id": "c61",
+              "leftValue": "={{ $json.cpv }}",
+              "rightValue": "79822",
+              "operator": {
+                "type": "string",
+                "operation": "contains"
+              }
+            },
+            {
+              "id": "c62",
+              "leftValue": "={{ $json.cpv }}",
+              "rightValue": "79823",
+              "operator": {
+                "type": "string",
+                "operation": "contains"
+              }
+            },
+            {
+              "id": "c63",
+              "leftValue": "={{ $json.cpv }}",
+              "rightValue": "92110",
+              "operator": {
+                "type": "string",
+                "operation": "contains"
+              }
+            },
+            {
+              "id": "c64",
+              "leftValue": "={{ $json.cpv }}",
+              "rightValue": "92111",
+              "operator": {
+                "type": "string",
+                "operation": "contains"
+              }
+            },
+            {
+              "id": "c65",
+              "leftValue": "={{ $json.cpv }}",
+              "rightValue": "92112",
+              "operator": {
+                "type": "string",
+                "operation": "contains"
+              }
+            }
+          ],
+          "combinator": "or"
+        },
+        "options": {}
+      },
+      "id": "df42b9e1-ad8c-4395-9ce2-6a9661252045",
+      "name": "🔍 Filtro keywords + CPV",
+      "type": "n8n-nodes-base.filter",
+      "typeVersion": 2.1,
+      "position": [
+        704,
+        256
+      ]
+    },
+    {
+      "parameters": {
+        "jsCode": "const keywords = [\n  { kw: \"museo\", peso: 10 },\n  { kw: \"realidad aumentada\", peso: 10 },\n  { kw: \"realidad virtual\", peso: 10 },\n  { kw: \"experiencia inmersiva\", peso: 10 },\n  { kw: \"inmersiv\", peso: 8 },\n  { kw: \"digitaliz\", peso: 9 },\n  { kw: \"contenidos digital\", peso: 9 },\n  { kw: \"patrimonio\", peso: 8 },\n  { kw: \"exposici\", peso: 8 },\n  { kw: \"fotogrametría\", peso: 9 },\n  { kw: \"escaneado 3d\", peso: 9 },\n  { kw: \"modelado 3d\", peso: 9 },\n  { kw: \"gemelo digital\", peso: 9 },\n  { kw: \"visita virtual\", peso: 9 },\n  { kw: \"metaverso\", peso: 8 },\n  { kw: \"teatro\", peso: 7 },\n  { kw: \"ópera\", peso: 7 },\n  { kw: \"audiovisual\", peso: 7 },\n  { kw: \"producción audiovisual\", peso: 8 },\n  { kw: \"transcodif\", peso: 7 },\n  { kw: \"multimedia\", peso: 6 },\n  { kw: \"streaming\", peso: 6 },\n  { kw: \"fotografía\", peso: 7 },\n  { kw: \"catalogación\", peso: 6 },\n  { kw: \"colección\", peso: 6 },\n  { kw: \"archivo\", peso: 5 },\n  { kw: \"biblioteca\", peso: 5 },\n  { kw: \"turismo digital\", peso: 8 },\n  { kw: \"turismo\", peso: 4 },\n  { kw: \"cultural\", peso: 5 },\n  { kw: \"arte\", peso: 4 },\n  { kw: \"escénic\", peso: 6 },\n  { kw: \"festival\", peso: 5 },\n  { kw: \"señalética\", peso: 5 },\n  { kw: \"interactiv\", peso: 7 },\n  { kw: \"documental\", peso: 6 },\n  { kw: \"sitio web\", peso: 4 },\n  { kw: \"página web\", peso: 4 },\n  { kw: \"portal web\", peso: 4 },\n  { kw: \"aplicación móvil\", peso: 6 },\n  { kw: \"app móvil\", peso: 6 },\n  { kw: \"contenidos\", peso: 1 },\n  { kw: \"plataforma\", peso: 1 }\n];\n\n// Umbral mínimo: por debajo de este score se descarta (no llega a la IA)\nconst UMBRAL_MINIMO = 7;\n\nconst salida = [];\nfor (const entrada of $input.all()) {\n  const item = entrada.json;\n  const texto = item.textoCompleto || \"\";\n\n  const encontradas = keywords.filter(k => texto.includes(k.kw));\n  const score = encontradas.reduce((acc, k) => acc + k.peso, 0);\n  const etiquetas = encontradas.map(k => k.kw).join(\", \");\n\n  if (score < UMBRAL_MINIMO) continue;\n\n  let relevancia = \"⚪ BAJA\";\n  if (score >= 8)  relevancia = \"🟡 MEDIA\";\n  if (score >= 15) relevancia = \"🟢 ALTA\";\n  if (score >= 25) relevancia = \"🔴 MUY ALTA\";\n\n  salida.push({ json: { ...item, score, etiquetas, relevancia } });\n}\n\nreturn salida;",
+        "mode": "runOnceForAllItems"
+      },
+      "id": "8fb64eb9-ad4a-446f-a4e6-e02e9d0a047d",
+      "name": "📊 Score de relevancia",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        928,
+        256
+      ]
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "http://localhost:11434/api/generate",
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={\n  \"model\": \"gemma3:27b\",\n  \"prompt\": \"Eres un experto en contratación pública española especializado en digitalización cultural.\\n\\nAnaliza esta licitación y responde ÚNICAMENTE con un objeto JSON válido, sin texto adicional, sin markdown, sin explicaciones:\\n\\n{\\n  \\\"objeto\\\": \\\"descripción en 2 líneas máximo\\\",\\n  \\\"presupuesto\\\": \\\"importe si aparece, o No especificado\\\",\\n  \\\"plazo\\\": \\\"plazo de ejecución\\\",\\n  \\\"fecha_limite\\\": \\\"fecha límite presentación\\\",\\n  \\\"criterios\\\": \\\"criterios de adjudicación con porcentajes si aparecen\\\",\\n  \\\"encaje\\\": \\\"APTO, DUDOSO o NO_APTO\\\",\\n  \\\"justificacion\\\": \\\"por qué encaja con empresa de digitalización cultural, AR, fotografía, contenidos digitales y turismo\\\",\\n  \\\"riesgos\\\": \\\"puntos críticos a revisar\\\",\\n  \\\"accion\\\": \\\"PRESENTARSE, ESTUDIAR o DESCARTAR\\\"\\n}\\n\\nLICITACIÓN:\\nTítulo: {{ $json.titulo }}\\nOrganismo: {{ $json.organismo }}\\nDescripción: {{ $json.descripcion }}\\nCPV: {{ $json.cpv }}\\nPresupuesto: {{ $json.presupuesto }}\\nFecha límite: {{ $json.fechaLimite }}\\nRelevancia: {{ $json.relevancia }} | Keywords: {{ $json.etiquetas }}\",\n  \"stream\": false,\n  \"options\": { \"temperature\": 0.2 }\n}",
+        "options": {
+          "timeout": 180000
+        }
+      },
+      "id": "1f93503f-2e60-4c09-8cae-2fa02ce85235",
+      "name": "🤖 IA local · configurar endpoint",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        1152,
+        256
+      ]
+    },
+    {
+      "parameters": {
+        "jsCode": "// Modo \"Run Once for All Items\". Itera todas las respuestas de la IA.\n// Recupera los datos originales via pairedItem (robusto aunque Score haya filtrado).\nconst salida = [];\nconst items = $input.all();\n\nfor (let i = 0; i < items.length; i++) {\n  const item = items[i].json;\n  const raw = item.response || \"{}\";\n\n  // Datos originales de la licitacion: emparejados por indice con el nodo Score.\n  // Usamos itemMatching(i) que respeta pairedItem; si falla, caemos al propio item.\n  let orig = {};\n  try {\n    orig = $(\"📊 Score de relevancia\").all()[i].json;\n  } catch (e) {\n    orig = item;\n  }\n\n  let analisis = {};\n  try {\n    const clean = String(raw).replace(/```json/g, \"\").replace(/```/g, \"\").trim();\n    analisis = JSON.parse(clean);\n  } catch (e) {\n    analisis = { objeto: \"Error de parsing\", encaje: \"DUDOSO\", accion: \"ESTUDIAR\", justificacion: String(raw).substring(0, 300), riesgos: \"Revisar manualmente\" };\n  }\n\n  const emojiAccion = { \"PRESENTARSE\": \"✅\", \"ESTUDIAR\": \"🔎\", \"DESCARTAR\": \"❌\" };\n  const emoji = emojiAccion[analisis.accion] || \"🔎\";\n\n  salida.push({\n    json: {\n      idEvl: orig.idEvl || \"\",\n      titulo: orig.titulo || \"Sin título\",\n      organismo: orig.organismo || \"\",\n      link: orig.link || \"\",\n      presupuesto: orig.presupuesto || \"\",\n      fechaLimite: orig.fechaLimite || \"\",\n      fechaPublicacion: orig.fechaPublicacion || \"\",\n      relevancia: orig.relevancia || \"\",\n      etiquetas: orig.etiquetas || \"\",\n      score: orig.score ?? \"\",\n      ...analisis,\n      emoji,\n      procesadoEn: new Date().toISOString()\n    }\n  });\n}\n\nreturn salida;",
+        "mode": "runOnceForAllItems"
+      },
+      "id": "6b633e55-33e3-41ff-b167-4450acee2699",
+      "name": "📝 Parsear respuesta IA",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        1376,
+        256
+      ]
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": false,
+            "leftValue": "",
+            "typeValidation": "strict",
+            "version": 1
+          },
+          "conditions": [
+            {
+              "id": "no-descartar",
+              "leftValue": "={{ $json.accion }}",
+              "rightValue": "=DESCARTAR",
+              "operator": {
+                "type": "string",
+                "operation": "notEquals"
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {
+          "ignoreCase": true
+        }
+      },
+      "id": "73c48011-41aa-47aa-aafb-0257ab35e2ed",
+      "name": "🚦 Filtrar descartadas",
+      "type": "n8n-nodes-base.filter",
+      "typeVersion": 2.1,
+      "position": [
+        1584,
+        256
+      ]
+    },
+    {
+      "parameters": {
+        "jsCode": "// Modo \"Run Once for All Items\": itera todas las licitaciones analizadas\nconst salida = [];\nfor (const entrada of $input.all()) {\n  const d = entrada.json;\n  const msg = `${d.emoji} *LICITACIÓN ${d.accion}*\n\n*${d.titulo}*\n🏛 ${d.organismo}\n${d.relevancia} | Score: ${d.score}\n🏷 ${d.etiquetas}\n\n📋 *OBJETO:*\n${d.objeto || 'Ver pliego'}\n\n💶 *PRESUPUESTO:* ${d.presupuesto || 'No especificado'}\n📅 *LÍMITE:* ${d.fecha_limite || d.fechaLimite || 'Ver pliego'}\n\n🎯 *CRITERIOS:*\n${d.criterios || 'Ver pliego'}\n\n✅ *ENCAJE:* ${d.encaje}\n${d.justificacion || ''}\n\n⚠️ *RIESGOS:*\n${d.riesgos || 'Ninguno detectado'}\n\n🔗 [Ver licitación](${d.link})`;\n\n  salida.push({ json: { mensaje: msg, ...d } });\n}\nreturn salida;",
+        "mode": "runOnceForAllItems"
+      },
+      "id": "cf02fe52-bec9-43b2-9c4c-b1690cd3cfce",
+      "name": "✍️ Formatear mensaje",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        1808,
+        256
+      ]
+    },
+    {
+      "parameters": {
+        "chatId": "REEMPLAZAR_CON_CHAT_ID",
+        "text": "={{ $json.mensaje }}",
+        "additionalFields": {
+          "appendAttribution": false,
+          "disable_web_page_preview": true,
+          "parse_mode": "Markdown"
+        }
+      },
+      "id": "9859e5aa-a64e-4d63-b2a0-16a933780f3d",
+      "name": "📱 Telegram · configurar credencial y chat",
+      "type": "n8n-nodes-base.telegram",
+      "typeVersion": 1.2,
+      "position": [
+        2032,
+        144
+      ]
+    },
+    {
+      "parameters": {
+        "authentication": "serviceAccount",
+        "operation": "append",
+        "documentId": {
+          "__rl": true,
+          "value": "REEMPLAZAR_CON_ID_DE_GOOGLE_SHEET",
+          "mode": "id"
+        },
+        "sheetName": {
+          "__rl": true,
+          "value": "Hoja 1",
+          "mode": "name"
+        },
+        "columns": {
+          "mappingMode": "defineBelow",
+          "value": {
+            "Justificación": "={{ $json.justificacion }}",
+            "Encaje": "={{ $json.encaje }}",
+            "Acción": "={{ $json.accion }}",
+            "Criterios": "={{ $json.criterios }}",
+            "Fecha Límite": "={{ $json.fecha_limite }}",
+            "Presupuesto": "={{ $json.presupuesto }}",
+            "Fecha": "={{ $json.fechaPublicacion }}",
+            "Organismo": "={{ $json.organismo }}",
+            "Keywords": "={{ $json.etiquetas }}",
+            "Link": "={{ $json.link }}",
+            "Riesgos": "={{ $json.riesgos }}",
+            "Relevancia": "={{ $json.relevancia }}",
+            "Título": "={{ $json.titulo }}",
+            "idEvl": "={{ \"'\" + $json.idEvl }}"
+          },
+          "matchingColumns": [],
+          "schema": [
+            {
+              "id": "idEvl",
+              "displayName": "idEvl",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "Fecha",
+              "displayName": "Fecha",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "Título",
+              "displayName": "Título",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "Organismo",
+              "displayName": "Organismo",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "Relevancia",
+              "displayName": "Relevancia",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "Keywords",
+              "displayName": "Keywords",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "Presupuesto",
+              "displayName": "Presupuesto",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "Fecha Límite",
+              "displayName": "Fecha Límite",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "Criterios",
+              "displayName": "Criterios",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "Encaje",
+              "displayName": "Encaje",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "Acción",
+              "displayName": "Acción",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "Justificación",
+              "displayName": "Justificación",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "Riesgos",
+              "displayName": "Riesgos",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "Link",
+              "displayName": "Link",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            }
+          ],
+          "attemptToConvertTypes": false,
+          "convertFieldsToString": false
+        },
+        "options": {}
+      },
+      "id": "405917a1-5faa-4329-99b6-6e4297a70295",
+      "name": "📊 Google Sheets · configurar credencial y hoja",
+      "type": "n8n-nodes-base.googleSheets",
+      "typeVersion": 4.4,
+      "position": [
+        2032,
+        384
+      ]
+    },
+    {
+      "parameters": {
+        "authentication": "serviceAccount",
+        "operation": "read",
+        "documentId": {
+          "__rl": true,
+          "value": "REEMPLAZAR_CON_ID_DE_GOOGLE_SHEET",
+          "mode": "list"
+        },
+        "sheetName": {
+          "__rl": true,
+          "value": "gid=0",
+          "mode": "list"
+        },
+        "options": {}
+      },
+      "id": "dedup-read-0001",
+      "name": "📒 Leer IDs ya guardados",
+      "type": "n8n-nodes-base.googleSheets",
+      "typeVersion": 4.4,
+      "position": [
+        -200,
+        480
+      ],
+      "credentials": {
+        "googleApi": {
+          "id": "REEMPLAZAR_CON_TU_CREDENCIAL",
+          "name": "Google Sheets account"
+        }
+      },
+      "alwaysOutputData": true
+    },
+    {
+      "parameters": {
+        "mode": "runOnceForAllItems",
+        "jsCode": "// Deduplicación por idEvl, robusta frente a:\n//  - codificado (%3D) vs decodificado (==)\n//  - apóstrofo inicial que Sheets añade al texto\n//  - celdas #ERROR! (cuando un id antiguo empezaba por + sin escapar)\nfunction normId(v){\n  let s = String(v == null ? \"\" : v).trim();\n  if (!s || s === \"#ERROR!\") return \"\";\n  if (s.charAt(0) === \"'\") s = s.slice(1);        // quita apóstrofo inicial\n  try { if (/%[0-9a-fA-F]{2}/.test(s)) s = decodeURIComponent(s); } catch(e){}\n  return s.trim();\n}\n\nconst yaGuardados = new Set();\nfor (const row of $input.all()) {\n  const raw = row.json.idEvl ?? row.json.IdEvl ?? row.json.idevl ?? row.json.ID;\n  const id = normId(raw);\n  if (id) yaGuardados.add(id);\n}\n\nlet nuevas = [];\ntry { nuevas = $(\"📊 Score de relevancia\").all(); } catch (e) { nuevas = []; }\n\nconst salida = [];\nconst vistos = new Set();\nfor (const entrada of nuevas) {\n  const it = entrada.json;\n  const id = normId(it.idEvl);\n  if (id && (yaGuardados.has(id) || vistos.has(id))) continue;\n  if (id) vistos.add(id);\n  salida.push({ json: it });\n}\nreturn salida;"
+      },
+      "id": "dedup-filter-0001",
+      "name": "🧹 Quitar duplicados (idEvl)",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        0,
+        256
+      ]
+    }
+  ],
+  "pinData": {},
+  "connections": {
+    "⏰ Cada día a las 7h": {
+      "main": [
+        [
+          {
+            "node": "🌀 Descargar+Paginar+Parsear",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "🌀 Descargar+Paginar+Parsear": {
+      "main": [
+        [
+          {
+            "node": "🔍 Filtro keywords + CPV",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "🔍 Filtro keywords + CPV": {
+      "main": [
+        [
+          {
+            "node": "📊 Score de relevancia",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "📊 Score de relevancia": {
+      "main": [
+        [
+          {
+            "node": "📒 Leer IDs ya guardados",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "🤖 IA local · configurar endpoint": {
+      "main": [
+        [
+          {
+            "node": "📝 Parsear respuesta IA",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "📝 Parsear respuesta IA": {
+      "main": [
+        [
+          {
+            "node": "🚦 Filtrar descartadas",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "🚦 Filtrar descartadas": {
+      "main": [
+        [
+          {
+            "node": "✍️ Formatear mensaje",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "✍️ Formatear mensaje": {
+      "main": [
+        [
+          {
+            "node": "📱 Telegram · configurar credencial y chat",
+            "type": "main",
+            "index": 0
+          },
+          {
+            "node": "📊 Google Sheets · configurar credencial y hoja",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "🧹 Quitar duplicados (idEvl)": {
+      "main": [
+        [
+          {
+            "node": "🤖 IA local · configurar endpoint",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "📒 Leer IDs ya guardados": {
+      "main": [
+        [
+          {
+            "node": "🧹 Quitar duplicados (idEvl)",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "active": false,
+  "settings": {
+    "executionOrder": "v1"
+  },
+  "tags": []
+}
